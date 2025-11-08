@@ -7,11 +7,13 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      SSH_PORT: ${{ secrets.SSH_PORT || '9632' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup SSH known_hosts
+      - name: Setup SSH known_hosts (port-aware)
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
@@ -22,16 +24,21 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
+      - name: Test SSH connectivity
+        run: |
+          ssh -p "$SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} 'echo "SSH OK: $(hostname)"'
+
       - name: Rsync to STAGING
         run: |
           rsync -az \
             --exclude-from=.rsync-exclude \
-            -e "ssh -o StrictHostKeyChecking=yes -l ${{ secrets.SSH_USER }}" \
+            -e "ssh -p $SSH_PORT -o BatchMode=yes -o StrictHostKeyChecking=yes -l ${{ secrets.SSH_USER }}" \
             ./ ${{ secrets.SSH_HOST }}:/var/www/staging.test.ubuntunet.net/
 
       - name: Rsync to PRODUCTION
         run: |
           rsync -az \
             --exclude-from=.rsync-exclude \
-            -e "ssh -o StrictHostKeyChecking=yes -l ${{ secrets.SSH_USER }}" \
+            -e "ssh -p $SSH_PORT -o BatchMode=yes -o StrictHostKeyChecking=yes -l ${{ secrets.SSH_USER }}" \
             ./ ${{ secrets.SSH_HOST }}:/var/www/test.ubuntunet.net/
