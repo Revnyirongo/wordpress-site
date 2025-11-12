@@ -8,7 +8,11 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
       SSH_PORT: ${{ secrets.SSH_PORT || '9632' }}
+      STAGING_PATH: /var/www/staging.test.ubuntunet.net
+      PROD_PATH: /var/www/test.ubuntunet.net
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,18 +31,58 @@ jobs:
       - name: Test SSH connectivity
         run: |
           ssh -p "$SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} 'echo "SSH OK: $(hostname)"'
+            "$SSH_USER@$SSH_HOST" 'echo "SSH OK: $(hostname)"'
 
       - name: Rsync to STAGING
         run: |
           rsync -az \
             --exclude-from=.rsync-exclude \
-            -e "ssh -p $SSH_PORT -o BatchMode=yes -o StrictHostKeyChecking=yes -l ${{ secrets.SSH_USER }}" \
-            ./ ${{ secrets.SSH_HOST }}:/var/www/staging.test.ubuntunet.net/
+            -e "ssh -p $SSH_PORT -o BatchMode=yes -o StrictHostKeyChecking=yes -l $SSH_USER" \
+            ./ "$SSH_HOST:$STAGING_PATH/"
 
       - name: Rsync to PRODUCTION
         run: |
           rsync -az \
             --exclude-from=.rsync-exclude \
-            -e "ssh -p $SSH_PORT -o BatchMode=yes -o StrictHostKeyChecking=yes -l ${{ secrets.SSH_USER }}" \
-            ./ ${{ secrets.SSH_HOST }}:/var/www/test.ubuntunet.net/
+            -e "ssh -p $SSH_PORT -o BatchMode=yes -o StrictHostKeyChecking=yes -l $SSH_USER" \
+            ./ "$SSH_HOST:$PROD_PATH/"
+
+      - name: Ensure plugins/themes from manifests (both sites)
+        run: |
+          ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" bash -s <<'REMOTE'
+          set -euo pipefail
+          wpbin="/usr/local/bin/wp"
+          st="$STAGING_PATH"
+          pr="$PROD_PATH"
+
+          ensure_items () {
+            site="$1"; manifest="$2"; kind="$3"  # kind=plugin|theme
+            [ -f "$site/wp-load.php" ] || { echo "ERROR: $site missing WP"; exit 1; }
+            [ -f "$site/$manifest" ] || { echo "No $manifest in $site, skipping"; return 0; }
+            while IFS= read -r line || [ -n "$line" ]; do
+              line="${line%%#*}"; line="$(echo "$line" | xargs)"   # trim & allow comments
+              [ -z "$line" ] && continue
+              slug="${line%%@*}"
+              ver="${line#*@}"; [ "$ver" = "$slug" ] && ver=""
+              if [ "$kind" = "plugin" ]; then
+                [ -n "$ver" ] && "$wpbin" --path="$site" plugin install "$slug" --version="$ver" --force --quiet \
+                              || "$wpbin" --path="$site" plugin install "$slug" --force --quiet
+                "$wpbin" --path="$site" plugin activate "$slug" --quiet || true
+              else
+                [ -n "$ver" ] && "$wpbin" --path="$site" theme install "$slug" --version="$ver" --force --quiet \
+                              || "$wpbin" --path="$site" theme install "$slug" --force --quiet
+                # Activate Astra on staging only
+                if [ "$site" = "$st" ] && [ "$slug" = "astra" ]; then
+                  "$wpbin" --path="$site" theme activate "$slug" --quiet || true
+                fi
+              fi
+            done < "$site/$manifest"
+          }
+
+          # Staging
+          ensure_items "$st" "deploy.plugins" plugin || true
+          ensure_items "$st" "deploy.themes"  theme  || true
+          # Production
+          ensure_items "$pr" "deploy.plugins" plugin || true
+          ensure_items "$pr" "deploy.themes"  theme  || true
+REMOTE
