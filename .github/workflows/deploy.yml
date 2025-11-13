@@ -33,45 +33,57 @@ jobs:
           ssh -p "$SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes \
             "$SSH_USER@$SSH_HOST" 'echo "SSH OK: $(hostname)"'
 
-      - name: Rsync to STAGING
+      - name: Rsync code to STAGING
         run: |
-          rsync -az \
+          rsync -az --delete \
             --exclude-from=.rsync-exclude \
             -e "ssh -p $SSH_PORT -o BatchMode=yes -o StrictHostKeyChecking=yes -l $SSH_USER" \
             ./ "$SSH_HOST:$STAGING_PATH/"
 
-      - name: Rsync to PRODUCTION
+      - name: Rsync code to PRODUCTION
         run: |
-          rsync -az \
+          rsync -az --delete \
             --exclude-from=.rsync-exclude \
             -e "ssh -p $SSH_PORT -o BatchMode=yes -o StrictHostKeyChecking=yes -l $SSH_USER" \
             ./ "$SSH_HOST:$PROD_PATH/"
 
       - name: Ensure plugins/themes from manifests (both sites)
+        shell: bash
         run: |
-          ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" bash -s <<'REMOTE'
+          # Pass env vars to remote and run a small provisioning script
+          ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            STAGING_PATH="$STAGING_PATH" PROD_PATH="$PROD_PATH" 'bash -se' <<'REMOTE'
           set -euo pipefail
+
           wpbin="/usr/local/bin/wp"
           st="$STAGING_PATH"
           pr="$PROD_PATH"
 
           ensure_items () {
-            site="$1"; manifest="$2"; kind="$3"  # kind=plugin|theme
+            site="$1"; manifest="$2"; kind="$3"   # kind=plugin|theme
             [ -f "$site/wp-load.php" ] || { echo "ERROR: $site missing WP"; exit 1; }
             [ -f "$site/$manifest" ] || { echo "No $manifest in $site, skipping"; return 0; }
+
             while IFS= read -r line || [ -n "$line" ]; do
-              line="${line%%#*}"; line="$(echo "$line" | xargs)"   # trim & allow comments
+              line="${line%%#*}"; line="$(echo "$line" | xargs)"   # strip comments + trim
               [ -z "$line" ] && continue
               slug="${line%%@*}"
               ver="${line#*@}"; [ "$ver" = "$slug" ] && ver=""
+
               if [ "$kind" = "plugin" ]; then
-                [ -n "$ver" ] && "$wpbin" --path="$site" plugin install "$slug" --version="$ver" --force --quiet \
-                              || "$wpbin" --path="$site" plugin install "$slug" --force --quiet
+                if [ -n "$ver" ]; then
+                  "$wpbin" --path="$site" plugin install "$slug" --version="$ver" --force --quiet
+                else
+                  "$wpbin" --path="$site" plugin install "$slug" --force --quiet
+                fi
                 "$wpbin" --path="$site" plugin activate "$slug" --quiet || true
               else
-                [ -n "$ver" ] && "$wpbin" --path="$site" theme install "$slug" --version="$ver" --force --quiet \
-                              || "$wpbin" --path="$site" theme install "$slug" --force --quiet
-                # Activate Astra on staging only
+                if [ -n "$ver" ]; then
+                  "$wpbin" --path="$site" theme install "$slug" --version="$ver" --force --quiet
+                else
+                  "$wpbin" --path="$site" theme install "$slug" --force --quiet
+                fi
+                # Auto-activate Astra on STAGING only
                 if [ "$site" = "$st" ] && [ "$slug" = "astra" ]; then
                   "$wpbin" --path="$site" theme activate "$slug" --quiet || true
                 fi
@@ -79,10 +91,9 @@ jobs:
             done < "$site/$manifest"
           }
 
-          # Staging
+          # Apply manifests on both sites
           ensure_items "$st" "deploy.plugins" plugin || true
           ensure_items "$st" "deploy.themes"  theme  || true
-          # Production
           ensure_items "$pr" "deploy.plugins" plugin || true
           ensure_items "$pr" "deploy.themes"  theme  || true
-REMOTE
+          REMOTE
